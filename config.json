@@ -1,0 +1,98 @@
+{
+  "check_interval_seconds": 10,
+  "sample_interval_seconds": 2,
+  "summary_log_interval_seconds": 10,
+  "once_probe_seconds": 2,
+  "stale_state_reset_seconds": 60,
+  "daily": {
+    "yellow_gb": 200,
+    "red_gb": 300,
+    "action_min_rate_mb_s": 10,
+    "action_min_process_gb": 100,
+    "action_min_share": 0.25
+  },
+  "yellow": {
+    "disk_write_mb_s": 150,
+    "duration_seconds": 30,
+    "cumulative_gb": 20,
+    "swap_gb": 5
+  },
+  "red": {
+    "disk_write_mb_s": 150,
+    "duration_seconds": 60,
+    "cumulative_gb": 40,
+    "swap_gb": 10
+  },
+  "dangerous_kill_on_yellow": true,
+  "dangerous_min_rate_mb_s": 150,
+  "dangerous_min_duration_seconds": 30,
+  "respawn_escalation": {
+    "kill_count": 3,
+    "window_seconds": 300,
+    "restart_after_seconds": 120
+  },
+  "notifications": {
+    "enabled": false,
+    "webhook_url": "",
+    "timeout_seconds": 5,
+    "notify_on": [
+      "kill",
+      "restart",
+      "respawn-escalation",
+      "alert-transition"
+    ]
+  },
+  "use_process_write_rate_fallback": true,
+  "observation_seconds": 7,
+  "post_kill_restart_seconds": 300,
+  "restart_cooldown_seconds": 3600,
+  "enable_authrestart": true,
+  "enable_safe_kill": true,
+  "kill_timeout_seconds": 10,
+  "log_file": "/var/log/ssd-sentry/ssd_sentry_monitor.log",
+  "state_file": "/var/db/ssd-sentry/state.json",
+  "safe_processes": [
+    "xcodebuild",
+    "clang",
+    "clang++",
+    "gcc",
+    "g++",
+    "make",
+    "cmake",
+    "rsync",
+    "tar",
+    "zip",
+    "unzip",
+    "git",
+    "svn"
+  ],
+  "dangerous_processes": [
+    "ffmpeg",
+    "convert",
+    "node",
+    "python",
+    "mongod"
+  ],
+  "excluded_system_processes": [
+    "kernel_task",
+    "launchd",
+    "loginwindow",
+    "WindowServer",
+    "syslogd",
+    "UserEventAgent",
+    "trustd",
+    "securityd",
+    "mds",
+    "mdworker",
+    "mdworker_shared",
+    "spotlight",
+    "fseventsd",
+    "notifyd",
+    "opendirectoryd",
+    "cfprefsd",
+    "teamviewer*",
+    "anydesk*",
+    "rustdesk*",
+    "remoting*"
+  ]
+}

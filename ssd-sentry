@@ -1,0 +1,1033 @@
+#!/bin/bash
+
+# ssd-sentry CLI management script
+# Provides convenient commands to manage the SSD Sentry daemon
+
+DAEMON_LABEL="com.ssdsentry.daemon"
+DAEMON_PLIST="/Library/LaunchDaemons/com.ssdsentry.daemon.plist"
+INSTALL_DIR="/usr/local/ssd-sentry"
+LOG_FILE="/var/log/ssd-sentry/ssd_sentry_monitor.log"
+CONFIG_FILE="$INSTALL_DIR/config.json"
+STATE_FILE="/var/db/ssd-sentry/state.json"
+INSTALLED_MONITOR="$INSTALL_DIR/ssd_sentry_monitor.py"
+METADATA_FILE="$INSTALL_DIR/install-metadata.json"
+
+resolve_script_dir() {
+    local source_path="$1"
+    while [ -L "$source_path" ]; do
+        local source_dir
+        source_dir="$(cd "$(dirname "$source_path")" && pwd)"
+        source_path="$(readlink "$source_path")"
+        if [[ "$source_path" != /* ]]; then
+            source_path="$source_dir/$source_path"
+        fi
+    done
+    cd "$(dirname "$source_path")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir "${BASH_SOURCE[0]}")"
+
+usage() {
+    cat << EOF
+SSD Sentry CLI
+Usage: ssd-sentry <command>
+
+Commands:
+  status          Show dashboard status and version consistency
+  reload          Reload daemon config without full restart
+  logs            Tail daemon logs (follow), or logs --err
+  restart         Restart the daemon
+  stop            Stop the daemon
+  start           Start the daemon
+  dry-run         Run a single test cycle (no enforcement)
+  config          Show configuration
+  edit-config     Edit configuration with nano
+  help            Show this message
+
+Examples:
+  ssd-sentry status
+  ssd-sentry status --watch
+  sudo "$(brew --prefix)/bin/ssd-sentry" reload
+  ssd-sentry logs
+  ssd-sentry logs --err
+  sudo "$(brew --prefix)/bin/ssd-sentry" restart
+
+EOF
+    exit 1
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This command requires root privileges"
+        exit 1
+    fi
+}
+
+cmd_status() {
+    if [[ "${1:-}" == "--watch" ]]; then
+        (
+            watch_cleanup_done=0
+            watch_cleanup() {
+                if [[ "$watch_cleanup_done" -eq 0 ]]; then
+                    watch_cleanup_done=1
+                    printf '\033[?25h\033[?1049l'
+                fi
+            }
+            trap 'watch_cleanup; exit 130' INT
+            trap 'watch_cleanup; exit 143' TERM
+            trap 'watch_cleanup' EXIT
+            printf '\033[?1049h\033[2J\033[H\033[?25l'
+            while true; do
+                local output
+                output="$(SSDP_FORCE_COLOR=1 SSDP_WATCH_MODE=1 cmd_status --once)"
+                printf '\033[H%s\033[J' "$output"
+                sleep 2
+            done
+        )
+        local status=$?
+        return $status
+    fi
+
+    local launch_output installed_info local_info metadata_json installed_exists
+    launch_output="$(launchctl print system/$DAEMON_LABEL 2>/dev/null || true)"
+    installed_exists="0"
+    if [[ -x "$INSTALLED_MONITOR" ]]; then
+        installed_exists="1"
+        installed_info="$(python3 "$INSTALLED_MONITOR" --runtime-info --config "$CONFIG_FILE" --state "$STATE_FILE" 2>/dev/null || true)"
+    else
+        installed_info=""
+    fi
+    if [[ -f "$SCRIPT_DIR/ssd_sentry_monitor.py" ]]; then
+        local_info="$(python3 "$SCRIPT_DIR/ssd_sentry_monitor.py" --runtime-info --config "$SCRIPT_DIR/config.json" --state /tmp/ssd-sentry-status-state.json 2>/dev/null || true)"
+    else
+        local_info=""
+    fi
+    if [[ -f "$METADATA_FILE" ]]; then
+        metadata_json="$(cat "$METADATA_FILE")"
+    else
+        metadata_json=""
+    fi
+
+    export SSDP_STATUS_LAUNCH="$launch_output"
+    export SSDP_STATUS_INSTALLED="$installed_info"
+    export SSDP_STATUS_LOCAL="$local_info"
+    export SSDP_STATUS_METADATA="$metadata_json"
+    export SSDP_STATUS_INSTALLED_EXISTS="$installed_exists"
+    export SSDP_STATUS_CONFIG_FILE="$CONFIG_FILE"
+    export SSDP_STATUS_STATE_FILE="$STATE_FILE"
+    export SSDP_STATUS_LOCAL_CLI="$SCRIPT_DIR/ssd-sentry"
+    export SSDP_STATUS_INSTALLED_CLI="$INSTALL_DIR/ssd-sentry"
+    python3 - <<'PY'
+from collections import deque
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import time
+
+launch_output = os.environ.get("SSDP_STATUS_LAUNCH", "")
+installed_raw = os.environ.get("SSDP_STATUS_INSTALLED", "")
+local_raw = os.environ.get("SSDP_STATUS_LOCAL", "")
+metadata_raw = os.environ.get("SSDP_STATUS_METADATA", "")
+installed_exists = os.environ.get("SSDP_STATUS_INSTALLED_EXISTS", "0") == "1"
+config_path = os.environ.get("SSDP_STATUS_CONFIG_FILE", "")
+state_path = os.environ.get("SSDP_STATUS_STATE_FILE", "")
+local_cli_path = os.environ.get("SSDP_STATUS_LOCAL_CLI", "")
+installed_cli_path = os.environ.get("SSDP_STATUS_INSTALLED_CLI", "")
+watch_mode = os.environ.get("SSDP_WATCH_MODE") == "1"
+force_color = os.environ.get("SSDP_FORCE_COLOR") == "1"
+use_color = force_color or os.isatty(1)
+
+installed = json.loads(installed_raw) if installed_raw.strip() else {}
+local = json.loads(local_raw) if local_raw.strip() else {}
+metadata = json.loads(metadata_raw) if metadata_raw.strip() else {}
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+SAMPLE_RE = re.compile(
+    r"sample rate=(?P<rate>[0-9.]+)MB/s physical=(?P<physical>[0-9.]+)MB/s "
+    r"process=(?P<process>[0-9.]+)MB/s delta=(?P<delta>[0-9.]+)MB "
+    r"window=(?P<window>[0-9.]+)s total=(?P<total>[0-9.]+)GB day=(?P<day>[0-9.]+)GB "
+    r"cumulative60=(?P<c60>[0-9.]+)GB cumulative120=(?P<c120>[0-9.]+)GB "
+    r"swap=(?P<swap>[0-9.]+)GB alert=(?P<alert>[A-Z]+)"
+)
+PROCESS_RE = re.compile(
+    r"process pid=(?P<pid>\d+) name=(?P<name>.+?) rate=(?P<rate>[0-9.]+)MB/s "
+    r"memory=(?P<memory>[0-9.]+)GB day=(?P<day>[0-9.]+)GB"
+)
+TS_RE = re.compile(r"^\[(?P<ts>[^\]]+)\]")
+STYLE_CODES = {
+    "bold": "1",
+    "dim": "2",
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+    "white": "37",
+    "bright_black": "90",
+}
+STATUS_SOCKET_FALLBACK = "/var/run/ssd-sentry/status.sock"
+
+
+def paint(text, *styles):
+    if not text or not use_color or not styles:
+        return text
+    codes = [STYLE_CODES[name] for name in styles if name in STYLE_CODES]
+    if not codes:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+def visible_len(text):
+    return len(strip_ansi(text))
+
+
+def crop_visible(text, width):
+    if width <= 0:
+        return ""
+    if visible_len(text) <= width:
+        return text
+    out = []
+    visible = 0
+    saw_ansi = False
+    i = 0
+    while i < len(text) and visible < width:
+        if text[i] == "\033":
+            match = ANSI_RE.match(text, i)
+            if match:
+                out.append(match.group(0))
+                i = match.end()
+                saw_ansi = True
+                continue
+        out.append(text[i])
+        visible += 1
+        i += 1
+    rendered = "".join(out)
+    if saw_ansi and not rendered.endswith("\033[0m"):
+        rendered += "\033[0m"
+    return rendered
+
+
+def pad_visible(text, width):
+    clipped = crop_visible(text, width)
+    return clipped + (" " * max(0, width - visible_len(clipped)))
+
+
+def fill_visible(text, width):
+    return pad_visible(text or "", max(0, width))
+
+
+def short_text(text, width):
+    if not text:
+        return "-"
+    text = str(text)
+    if width <= 3 or len(text) <= width:
+        return text[:width]
+    return text[: max(0, width - 3)] + "..."
+
+
+def fmt_num(value, decimals=2):
+    try:
+        value = float(value)
+    except Exception:
+        return "-"
+    if abs(value - round(value)) < 0.005:
+        return f"{int(round(value))}"
+    return f"{value:.{decimals}f}"
+
+
+def fmt_timestamp(epoch_value):
+    if not epoch_value:
+        return "idle"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(epoch_value)))
+    except Exception:
+        return "unknown"
+
+
+def parse_display_timestamp(value):
+    if not value or value in {"unknown", "idle"}:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(value, fmt))
+        except ValueError:
+            continue
+    return None
+
+
+def level_color(level):
+    level = (level or "").upper()
+    if level in {"RED", "CRITICAL"}:
+        return "red"
+    if level == "YELLOW":
+        return "yellow"
+    if level == "NORMAL":
+        return "green"
+    return "white"
+
+
+def level_badge(level):
+    label = (level or "UNKNOWN").upper()
+    return paint(f"[{label}]", "bold", level_color(label))
+
+
+def metric_level(value, yellow_limit=None, red_limit=None):
+    try:
+        value = float(value)
+    except Exception:
+        return "UNKNOWN"
+    if red_limit is not None and value >= float(red_limit):
+        return "RED"
+    if yellow_limit is not None and value >= float(yellow_limit):
+        return "YELLOW"
+    return "NORMAL"
+
+
+def metric_bar(label, value, yellow_limit=None, red_limit=None, scale_limit=None, unit=""):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    if scale_limit is None:
+        scale_limit = red_limit if red_limit not in (None, 0) else yellow_limit
+    try:
+        scale_limit = float(scale_limit)
+    except Exception:
+        scale_limit = 0.0
+    bar_width = 20
+    ratio = 0.0 if scale_limit <= 0 else max(0.0, min(1.0, value / scale_limit))
+    filled = int(round(ratio * bar_width))
+    level = metric_level(value, yellow_limit, red_limit)
+    color = level_color(level)
+    bar_fill = paint("|" * filled, "bold", color)
+    bar_empty = paint("." * (bar_width - filled), "bright_black")
+    limit_text = fmt_num(scale_limit)
+    value_text = f"{fmt_num(value):>8} / {limit_text:>6} {unit}".rstrip()
+    return f"{label:<6} [{bar_fill}{bar_empty}] {paint(value_text, color)}"
+
+
+def make_box(title, lines, width):
+    width = max(width, 24)
+    label = crop_visible(f" {title} ", max(0, width - 2))
+    top = "+" + strip_ansi(label) + "-" * max(0, width - 2 - visible_len(label)) + "+"
+    bottom = "+" + "-" * (width - 2) + "+"
+    rendered = [paint(top, "cyan")]
+    inner_width = width - 4
+    for line in lines:
+        rendered.append(
+            paint("|", "cyan") + " " + pad_visible(line, inner_width) + " " + paint("|", "cyan")
+        )
+    rendered.append(paint(bottom, "cyan"))
+    return rendered
+
+
+def stack_or_columns(left_box, right_box, total_width):
+    if total_width < 110:
+        return left_box + [""] + right_box
+    gap = " "
+    left_blank = " " * visible_len(left_box[0])
+    right_blank = " " * visible_len(right_box[0])
+    rows = []
+    for idx in range(max(len(left_box), len(right_box))):
+        left = left_box[idx] if idx < len(left_box) else left_blank
+        right = right_box[idx] if idx < len(right_box) else right_blank
+        rows.append(left + gap + right)
+    return rows
+
+
+def render_watch_pairs(pairs, total_width, collapse_width=92, gap=3):
+    lines = []
+    total_width = max(1, total_width)
+    if total_width < collapse_width:
+        for left, right in pairs:
+            if left:
+                lines.append(fill_visible(left, total_width))
+            if right:
+                lines.append(fill_visible(right, total_width))
+        return lines
+
+    left_width = max(1, (total_width - gap) // 2)
+    right_width = max(1, total_width - left_width - gap)
+    spacer = " " * gap
+    for left, right in pairs:
+        lines.append(
+            fill_visible(left, left_width) + spacer + fill_visible(right, right_width)
+        )
+    return lines
+
+
+def read_recent_lines(path, max_lines=400):
+    if not path or not os.path.exists(path):
+        return []
+    buf = deque(maxlen=max_lines)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                buf.append(line.rstrip("\n"))
+    except OSError:
+        return []
+    return list(buf)
+
+
+def parse_recent_status(lines):
+    latest_sample = None
+    latest_processes = []
+    current_sample = None
+    current_processes = []
+    for raw in lines:
+        sample_match = SAMPLE_RE.search(raw)
+        if sample_match:
+            current_sample = sample_match.groupdict()
+            ts_match = TS_RE.match(raw)
+            current_sample["logged_at"] = ts_match.group("ts") if ts_match else "unknown"
+            latest_sample = current_sample
+            current_processes = []
+            latest_processes = current_processes
+            continue
+        process_match = PROCESS_RE.search(raw)
+        if process_match and current_sample is not None:
+            current_processes.append(process_match.groupdict())
+    latest_processes.sort(key=lambda item: float(item.get("rate", 0.0)), reverse=True)
+    return latest_sample, latest_processes
+
+
+def load_json_if_readable(path):
+    if not path:
+        return {}, "missing path"
+    if not os.path.exists(path):
+        return {}, "missing"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle), None
+    except PermissionError:
+        return {}, "permission denied"
+    except OSError as exc:
+        return {}, str(exc)
+
+
+def sha256_of_file(path):
+    if not path or not os.path.exists(path):
+        return ""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def load_live_snapshot(path, timeout=0.4):
+    if not path:
+        return None, "missing path"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(path)
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        if not chunks:
+            return None, "empty response"
+        return json.loads(b"".join(chunks).decode("utf-8")), None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+    finally:
+        client.close()
+
+
+def trigger_flags(sample, y_rate, r_rate, y_c60, r_c120, y_day, r_day, y_swap, r_swap):
+    if not sample:
+        return ["NO-SAMPLE"]
+    flags = []
+    rate = float(sample["rate"])
+    c60 = float(sample["c60"])
+    c120 = float(sample["c120"])
+    day = float(sample["day"])
+    swap = float(sample["swap"])
+    if rate >= r_rate:
+        flags.append("RATE-RED")
+    elif rate >= y_rate:
+        flags.append("RATE-YELLOW")
+    if c60 >= y_c60:
+        flags.append("60S-YELLOW")
+    if c120 >= r_c120:
+        flags.append("120S-RED")
+    if day >= r_day:
+        flags.append("DAY-RED")
+    elif day >= y_day:
+        flags.append("DAY-YELLOW")
+    if swap >= r_swap:
+        flags.append("SWAP-RED")
+    elif swap >= y_swap:
+        flags.append("SWAP-YELLOW")
+    return flags or ["none"]
+
+
+def load_average_text():
+    try:
+        load1, load5, load15 = os.getloadavg()
+        return f"{load1:.2f}, {load5:.2f}, {load15:.2f}"
+    except (AttributeError, OSError):
+        return "unavailable"
+
+
+config, config_error = load_json_if_readable(config_path)
+state, state_error = load_json_if_readable(state_path)
+log_path = config.get("log_file", "/var/log/ssd-sentry/ssd_sentry_monitor.log")
+latest_sample, latest_processes = parse_recent_status(read_recent_lines(log_path))
+status_socket_path = (
+    installed.get("status_socket_path")
+    or local.get("status_socket_path")
+    or STATUS_SOCKET_FALLBACK
+)
+live_snapshot, live_error = load_live_snapshot(status_socket_path)
+
+yellow = config.get("yellow", {})
+red = config.get("red", {})
+daily = config.get("daily", {})
+y_rate = float(yellow.get("disk_write_mb_s", 150))
+r_rate = float(red.get("disk_write_mb_s", 150))
+y_day = float(daily.get("yellow_gb", 200))
+r_day = float(daily.get("red_gb", 300))
+y_swap = float(yellow.get("swap_gb", 5))
+r_swap = float(red.get("swap_gb", 10))
+y_c60 = float(yellow.get("cumulative_gb", 20))
+r_c120 = float(red.get("cumulative_gb", 40))
+observation_seconds = int(config.get("observation_seconds", 7))
+restart_seconds = int(config.get("post_kill_restart_seconds", 300))
+sample_interval = float(config.get("sample_interval_seconds", 2))
+summary_log_interval = float(config.get("summary_log_interval_seconds", config.get("check_interval_seconds", 10)))
+
+daemon_state = "not running"
+pid = ""
+script_path = installed.get("script_path", "")
+if launch_output.strip():
+    for raw_line in launch_output.splitlines():
+        line = raw_line.strip().strip('"')
+        if line.startswith("state = "):
+            daemon_state = line.split("=", 1)[1].strip()
+        elif line.startswith("pid = "):
+            pid = line.split("=", 1)[1].strip()
+        elif not script_path and line.endswith("ssd_sentry_monitor.py"):
+            script_path = line
+
+snapshot_source = "log-fallback"
+if live_snapshot and live_snapshot.get("sample_time"):
+    snapshot_source = "live-socket"
+    latest_processes = [
+        {
+            "pid": str(item.get("pid", "-")),
+            "rate": item.get("rate_mb_s", 0.0),
+            "memory": item.get("memory_gb", 0.0),
+            "day": item.get("daily_written_gb", 0.0),
+            "name": item.get("name", "-")
+        }
+        for item in live_snapshot.get("process_metrics", [])
+    ]
+    rate = float(live_snapshot.get("effective_rate_mb_s", 0.0))
+    physical = float(live_snapshot.get("physical_rate_mb_s", 0.0))
+    process = float(live_snapshot.get("process_rate_mb_s", 0.0))
+    c60 = float(live_snapshot.get("cumulative_60_gb", 0.0))
+    c120 = float(live_snapshot.get("cumulative_120_gb", 0.0))
+    day_total = float(live_snapshot.get("daily_written_gb", 0.0))
+    swap = float(live_snapshot.get("swap_gb", 0.0))
+    total_written = fmt_num(live_snapshot.get("total_written_gb", 0.0))
+    alert = live_snapshot.get("alert", "UNKNOWN")
+    sample_time = fmt_timestamp(live_snapshot.get("sample_time"))
+    observation_until = live_snapshot.get("observation_until")
+    red_since = live_snapshot.get("red_since")
+    trigger_text = ", ".join(live_snapshot.get("triggers") or ["none"])
+    live_mode = live_snapshot.get("mode", "")
+elif latest_sample:
+    rate = float(latest_sample["rate"])
+    physical = float(latest_sample["physical"])
+    process = float(latest_sample["process"])
+    c60 = float(latest_sample["c60"])
+    c120 = float(latest_sample["c120"])
+    day_total = float(latest_sample["day"])
+    swap = float(latest_sample["swap"])
+    total_written = latest_sample["total"]
+    alert = latest_sample["alert"]
+    sample_time = latest_sample["logged_at"]
+    observation_until = state.get("observation_until")
+    red_since = state.get("red_since")
+    trigger_text = ", ".join(trigger_flags(latest_sample, y_rate, r_rate, y_c60, r_c120, y_day, r_day, y_swap, r_swap))
+    live_mode = ""
+else:
+    rate = 0.0
+    physical = 0.0
+    process = 0.0
+    c60 = 0.0
+    c120 = 0.0
+    day_total = 0.0
+    swap = 0.0
+    total_written = "-"
+    alert = "UNKNOWN"
+    sample_time = "unknown"
+    observation_until = state.get("observation_until")
+    red_since = state.get("red_since")
+    trigger_text = "NO-SAMPLE"
+    live_mode = ""
+
+now = time.time()
+if live_mode == "observation" or (observation_until and float(observation_until) > now):
+    mode_label = paint("OBSERVE", "bold", "yellow")
+    mode_detail = fmt_timestamp(observation_until)
+elif live_mode == "actionable-red" or red_since:
+    mode_label = paint("ACTION RED", "bold", "red")
+    mode_detail = fmt_timestamp(red_since)
+else:
+    mode_label = paint("STEADY", "bold", "green")
+    mode_detail = "idle"
+
+state_status = "readable" if not state_error else f"unreadable ({state_error})"
+config_status = "readable" if not config_error else f"unreadable ({config_error})"
+installed_version = installed.get("version", "missing") if installed else (
+    "incompatible" if installed_exists else "missing"
+)
+installed_sha = installed.get("script_sha256", "")[:12] if installed else ""
+local_version = local.get("version", "missing") if local else "missing"
+local_sha = local.get("script_sha256", "")[:12] if local else ""
+local_cli_sha = sha256_of_file(local_cli_path)[:12]
+installed_cli_sha = sha256_of_file(installed_cli_path)[:12]
+
+daemon_compare = "n/a"
+if local and installed:
+    daemon_compare = "OK" if local.get("script_sha256") == installed.get("script_sha256") else "DIFFERENT"
+elif local and not installed_exists:
+    daemon_compare = "not installed"
+
+cli_compare = "n/a"
+if local_cli_sha and installed_cli_sha:
+    cli_compare = "OK" if local_cli_sha == installed_cli_sha else "DIFFERENT"
+elif local_cli_sha and not installed_cli_sha:
+    cli_compare = "not installed"
+
+install_consistency = "unknown"
+config_drift = "unknown"
+if metadata:
+    expected = metadata.get("script_sha256")
+    actual = installed.get("script_sha256")
+    if expected and actual:
+        install_consistency = "OK" if expected == actual else "MISMATCH"
+    config_expected = metadata.get("config_sha256")
+    config_actual = installed.get("config_sha256")
+    if config_expected and config_actual:
+        config_drift = "edited since install" if config_expected != config_actual else "clean"
+
+term_size = shutil.get_terminal_size(fallback=(118, 40))
+raw_terminal_width = max(1, term_size.columns)
+raw_terminal_height = max(1, term_size.lines)
+terminal_width = raw_terminal_width if watch_mode else max(88, raw_terminal_width)
+terminal_height = max(14 if watch_mode else 20, raw_terminal_height)
+content_width = min(terminal_width, 140)
+column_gap = 1
+column_width = (content_width - column_gap) // 2
+right_width = content_width - column_width - column_gap
+
+header_title = paint("SSD Sentry", "bold", "white")
+header_mode = "watch" if watch_mode else "snapshot"
+header_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+header_line = f"{header_title}  {paint(header_mode, 'cyan')}  {paint(header_time, 'bright_black')}"
+subheader = paint(
+    f"refresh=2s  log={short_text(log_path, max(20, content_width - 18))}",
+    "bright_black",
+)
+
+launch_state_text = paint((daemon_state or "unknown").upper(), "bold", level_color("NORMAL" if daemon_state == "active" else "RED"))
+
+service_lines = [
+    f"launchd      {launch_state_text}  pid {pid or '-'}",
+    f"daemon       {short_text(script_path or '-', 40)}",
+    f"snapshot     {snapshot_source}",
+    f"sample       {sample_time}",
+    f"alert        {level_badge(alert)}",
+    f"mode         {mode_label}",
+    f"trigger      {trigger_text}",
+]
+
+policy_lines = [
+    f"rate Y/R     {fmt_num(y_rate)} / {fmt_num(r_rate)} MB/s",
+    f"60s / 120s   {fmt_num(y_c60)} / {fmt_num(r_c120)} GB",
+    f"day Y/R      {fmt_num(y_day)} / {fmt_num(r_day)} GB",
+    f"swap Y/R     {fmt_num(y_swap)} / {fmt_num(r_swap)} GB",
+    f"sample / log {fmt_num(sample_interval)}s / {fmt_num(summary_log_interval)}s",
+    f"observe      {observation_seconds}s after each kill",
+    f"restart      {restart_seconds}s actionable RED",
+]
+
+meter_lines = [
+    metric_bar("RATE", rate, y_rate, r_rate, r_rate, "MB/s"),
+    metric_bar("PHYS", physical, y_rate, r_rate, r_rate, "MB/s"),
+    metric_bar("PROC", process, y_rate, r_rate, r_rate, "MB/s"),
+    metric_bar("60S", c60, y_c60, None, y_c60, "GB"),
+    metric_bar("120S", c120, None, r_c120, r_c120, "GB"),
+    metric_bar("DAY", day_total, y_day, r_day, r_day, "GB"),
+    metric_bar("SWAP", swap, y_swap, r_swap, r_swap, "GB"),
+]
+
+state_lines = [
+    f"total written   {total_written} GB" if total_written != "-" else "total written   -",
+    f"red since       {fmt_timestamp(red_since)}",
+    f"observe until   {fmt_timestamp(observation_until) if observation_until else 'inactive'}",
+    f"files           state={state_status} config={config_status}",
+    f"daemon compare  {daemon_compare}",
+    f"cli compare     {cli_compare}",
+    f"install check   {install_consistency}",
+]
+
+writer_width = content_width
+writer_inner = writer_width - 4
+name_width = max(18, writer_inner - 7 - 11 - 9 - 9 - 4)
+writer_header = (
+    f"{'PID':<7} {'RATE MB/s':>10} {'MEM GB':>8} {'DAY GB':>8}  {'NAME':<{name_width}}"
+)
+writer_rows = [paint(writer_header, "bold", "white")]
+for item in latest_processes[:6]:
+    writer_rows.append(
+        f"{item['pid']:<7} {fmt_num(item['rate']):>10} {fmt_num(item['memory']):>8} "
+        f"{fmt_num(item['day']):>8}  {short_text(item['name'], name_width)}"
+    )
+while len(writer_rows) < 7:
+    writer_rows.append("-")
+
+install_lines = [
+    f"installed     {installed_version} {f'[{installed_sha}]' if installed_sha else ''}".rstrip(),
+    f"repo copy     {local_version} {f'[{local_sha}]' if local_sha else ''}".rstrip(),
+    f"installed cli  {f'[{installed_cli_sha}]' if installed_cli_sha else 'missing'}",
+    f"repo cli       {f'[{local_cli_sha}]' if local_cli_sha else 'missing'}",
+    f"installed at  {metadata.get('installed_at_utc', 'unknown') if metadata else 'missing'}",
+]
+
+notes = []
+if not latest_sample and snapshot_source != "live-socket":
+    notes.append(f"no parsable samples in {log_path}")
+if state_error:
+    notes.append(f"state file issue: {state_error}")
+if config_error:
+    notes.append(f"config file issue: {config_error}")
+if snapshot_source != "live-socket" and live_error and daemon_state == "active":
+    notes.append(f"live snapshot unavailable: {live_error}")
+if installed_exists and not installed:
+    notes.append("installed monitor is incompatible with runtime-info")
+if not metadata:
+    notes.append("install metadata missing")
+if config_drift == "edited since install":
+    notes.append("installed config drift detected")
+if not notes:
+    notes = ["healthy: no warnings", "watch prefers daemon RAM snapshot before log fallback", "-"]
+while len(notes) < 3:
+    notes.append("-")
+
+if watch_mode:
+    load_text = load_average_text()
+    visible_processes = len(latest_processes)
+    positive_writers = len([item for item in latest_processes if float(item.get("rate", 0.0)) > 0.0])
+    sample_age = "-"
+    parsed_sample_epoch = parse_display_timestamp(sample_time)
+    if parsed_sample_epoch is not None:
+        sample_age = f"{max(0, int(now - parsed_sample_epoch))}s"
+
+    plain_alert = (alert or "UNKNOWN").upper()
+    issue_text = notes[0] if notes and notes[0] != "-" else "healthy"
+    top_header = crop_visible(
+        f"{paint('SSD Sentry', 'bold', 'white')}  {paint('watch', 'cyan')} "
+        f"{paint(header_time, 'bright_black')}",
+        content_width,
+    )
+    state_text = fmt_timestamp(red_since)
+    observe_text = fmt_timestamp(observation_until) if observation_until else "inactive"
+    summary_pairs = [
+        (
+            f"Daemon {launch_state_text}  pid {pid or '-'}  Alert {level_badge(plain_alert)}",
+            f"Mode {mode_label}  Source {snapshot_source}",
+        ),
+        (
+            f"Sample {sample_time}  Age {sample_age}",
+            f"Sample/Log {fmt_num(sample_interval)}s/{fmt_num(summary_log_interval)}s  Load {load_text}",
+        ),
+        (
+            f"Rate {fmt_num(rate)}  Phys {fmt_num(physical)}  Proc {fmt_num(process)} MB/s",
+            f"60s {fmt_num(c60)}/{fmt_num(y_c60)}  120s {fmt_num(c120)}/{fmt_num(r_c120)} GB",
+        ),
+        (
+            f"Day {fmt_num(day_total)}/{fmt_num(r_day)}  Swap {fmt_num(swap)}/{fmt_num(r_swap)} GB",
+            f"Total {total_written} GB  Writers {positive_writers}/{visible_processes}",
+        ),
+        (
+            f"Trigger {trigger_text}",
+            f"State {state_text}  Observe {observe_text}",
+        ),
+        (
+            f"Files state={state_status}  config={config_status}",
+            f"Daemon {daemon_compare}  CLI {cli_compare}  Install {install_consistency}",
+        ),
+    ]
+
+    separator = paint("-" * max(1, content_width), "bright_black")
+    lines = [fill_visible(top_header, content_width), fill_visible(separator, content_width)]
+    lines.extend(render_watch_pairs(summary_pairs, content_width))
+    lines.append(fill_visible(f"Note {issue_text}", content_width))
+    lines.append(fill_visible(separator, content_width))
+
+    if content_width >= 96:
+        pid_width = 7
+        rate_width = 10
+        mem_width = 8
+        day_width = 8
+        name_width = max(12, content_width - pid_width - rate_width - mem_width - day_width - 4)
+        table_header = paint(
+            f"{'PID':<{pid_width}} {'COMMAND':<{name_width}} {'RATE':>{rate_width}} "
+            f"{'MEM':>{mem_width}} {'DAY':>{day_width}}",
+            "bold",
+            "white",
+        )
+        def render_process_row(item):
+            rate_value = float(item.get("rate", 0.0))
+            mem_value = float(item.get("memory", 0.0))
+            day_value = float(item.get("day", 0.0))
+            name_value = short_text(item.get("name", "-"), name_width)
+            rate_color = level_color(
+                "RED" if rate_value >= r_rate else "YELLOW" if rate_value >= y_rate else "NORMAL"
+            )
+            return (
+                f"{str(item.get('pid', '-')):<{pid_width}} "
+                f"{pad_visible(name_value, name_width)} "
+                f"{paint(f'{fmt_num(rate_value):>{rate_width}}', rate_color)} "
+                f"{fmt_num(mem_value):>{mem_width}} "
+                f"{fmt_num(day_value):>{day_width}}"
+            )
+    elif content_width >= 74:
+        pid_width = 6
+        rate_width = 9
+        mem_width = 7
+        name_width = max(12, content_width - pid_width - rate_width - mem_width - 3)
+        table_header = paint(
+            f"{'PID':<{pid_width}} {'COMMAND':<{name_width}} {'RATE':>{rate_width}} {'MEM':>{mem_width}}",
+            "bold",
+            "white",
+        )
+        def render_process_row(item):
+            rate_value = float(item.get("rate", 0.0))
+            mem_value = float(item.get("memory", 0.0))
+            name_value = short_text(item.get("name", "-"), name_width)
+            rate_color = level_color(
+                "RED" if rate_value >= r_rate else "YELLOW" if rate_value >= y_rate else "NORMAL"
+            )
+            return (
+                f"{str(item.get('pid', '-')):<{pid_width}} "
+                f"{pad_visible(name_value, name_width)} "
+                f"{paint(f'{fmt_num(rate_value):>{rate_width}}', rate_color)} "
+                f"{fmt_num(mem_value):>{mem_width}}"
+            )
+    else:
+        pid_width = 6
+        rate_width = 8
+        name_width = max(8, content_width - pid_width - rate_width - 2)
+        table_header = paint(
+            f"{'PID':<{pid_width}} {'COMMAND':<{name_width}} {'RATE':>{rate_width}}",
+            "bold",
+            "white",
+        )
+        def render_process_row(item):
+            rate_value = float(item.get("rate", 0.0))
+            name_value = short_text(item.get("name", "-"), name_width)
+            rate_color = level_color(
+                "RED" if rate_value >= r_rate else "YELLOW" if rate_value >= y_rate else "NORMAL"
+            )
+            return (
+                f"{str(item.get('pid', '-')):<{pid_width}} "
+                f"{pad_visible(name_value, name_width)} "
+                f"{paint(f'{fmt_num(rate_value):>{rate_width}}', rate_color)}"
+            )
+
+    table_rows = [fill_visible(table_header, content_width)]
+    header_row_count = len(lines) + 1
+    process_row_limit = max(4, terminal_height - header_row_count)
+    for item in latest_processes[:process_row_limit]:
+        table_rows.append(fill_visible(render_process_row(item), content_width))
+    if len(table_rows) == 1:
+        table_rows.append(fill_visible("no process writer data available", content_width))
+    while len(table_rows) < (process_row_limit + 1):
+        table_rows.append(" " * content_width)
+
+    lines.extend(table_rows)
+else:
+    service_box = make_box("Service", service_lines, column_width if content_width >= 110 else content_width)
+    policy_box = make_box("Policy", policy_lines, right_width if content_width >= 110 else content_width)
+    meter_box = make_box("Live Meters", meter_lines, column_width if content_width >= 110 else content_width)
+    state_box = make_box("State", state_lines, right_width if content_width >= 110 else content_width)
+    writers_box = make_box("Top Writers", writer_rows, content_width)
+    install_box = make_box("Install", install_lines, content_width)
+    notes_box = make_box("Notes", notes[:3], content_width)
+
+    lines = [header_line, subheader]
+    lines.extend(stack_or_columns(service_box, policy_box, content_width))
+    lines.append("")
+    lines.extend(stack_or_columns(meter_box, state_box, content_width))
+    lines.append("")
+    lines.extend(writers_box)
+    lines.append("")
+    lines.extend(install_box)
+    lines.append("")
+    lines.extend(notes_box)
+if watch_mode:
+    lines = [fill_visible(line, content_width) for line in lines]
+
+print("\n".join(lines))
+PY
+}
+
+cmd_reload() {
+    check_root
+    echo "Reloading daemon configuration..."
+    if launchctl kill HUP system/$DAEMON_LABEL 2>/dev/null; then
+        echo "Done"
+        return 0
+    fi
+
+    local pid
+    pid="$(launchctl print system/$DAEMON_LABEL 2>/dev/null | awk '/^[[:space:]]*pid = / {print $3; exit}')"
+    if [[ -n "$pid" ]]; then
+        kill -HUP "$pid"
+        echo "Done"
+        return 0
+    fi
+
+    echo "Daemon is not running"
+    return 1
+}
+
+cmd_logs() {
+    local target="$LOG_FILE"
+    if [[ "${1:-}" == "--err" ]]; then
+        target="/var/log/ssd-sentry/ssd_sentry_daemon.err.log"
+    fi
+    if [[ ! -f "$target" ]]; then
+        echo "Log file not found: $target"
+        exit 1
+    fi
+    tail -f "$target"
+}
+
+cmd_restart() {
+    check_root
+    echo "Restarting daemon..."
+    launchctl bootout system "$DAEMON_PLIST" 2>/dev/null || true
+    sleep 1
+    launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null || true
+    launchctl kickstart -k system/$DAEMON_LABEL 2>/dev/null || true
+    echo "Done"
+}
+
+cmd_stop() {
+    check_root
+    echo "Stopping daemon..."
+    launchctl bootout system "$DAEMON_PLIST" 2>/dev/null || echo "Daemon not running"
+}
+
+cmd_start() {
+    check_root
+    echo "Starting daemon..."
+    launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null || echo "Failed to start daemon"
+}
+
+cmd_dry_run() {
+    echo "Running dry-run test cycle..."
+    local state_file
+    state_file="$(mktemp /tmp/ssd-sentry-state.XXXXXX.json)"
+    python3 "$INSTALLED_MONITOR" --dry-run --once --state "$state_file"
+    local status=$?
+    rm -f "$state_file"
+    return $status
+}
+
+cmd_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
+    cat "$CONFIG_FILE"
+}
+
+cmd_edit_config() {
+    check_root
+    nano "$CONFIG_FILE"
+    echo "Config updated. Restart daemon to apply changes:"
+    echo "  sudo \"\$(brew --prefix)/bin/ssd-sentry\" restart"
+}
+
+case "${1:-help}" in
+    status)
+        cmd_status "${2:-}"
+        ;;
+    reload)
+        cmd_reload
+        ;;
+    logs)
+        cmd_logs "${2:-}"
+        ;;
+    restart)
+        cmd_restart
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    start)
+        cmd_start
+        ;;
+    dry-run)
+        cmd_dry_run
+        ;;
+    config)
+        cmd_config
+        ;;
+    edit-config)
+        cmd_edit_config
+        ;;
+    help|--help|-h)
+        cat << EOF
+SSD Sentry CLI
+Usage: ssd-sentry <command>
+
+Commands:
+  status          Show dashboard status and version consistency
+  reload          Reload daemon config without full restart
+  logs            Tail daemon logs (follow), or logs --err
+  restart         Restart the daemon
+  stop            Stop the daemon
+  start           Start the daemon
+  dry-run         Run a single test cycle (no enforcement)
+  config          Show configuration
+  edit-config     Edit configuration with nano
+  help            Show this message
+
+Examples:
+  ssd-sentry status
+  ssd-sentry status --watch
+  sudo "$(brew --prefix)/bin/ssd-sentry" reload
+  ssd-sentry logs
+  ssd-sentry logs --err
+  sudo "$(brew --prefix)/bin/ssd-sentry" restart
+
+EOF
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        ;;
+esac

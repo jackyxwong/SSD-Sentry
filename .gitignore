@@ -1,0 +1,22 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Build artifacts
+dist/
+*.tar.gz
+*.sha256
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
